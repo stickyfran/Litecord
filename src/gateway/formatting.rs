@@ -205,7 +205,8 @@ fn apply_inline_markdown(input: &str) -> String {
     s = regex_replace_simple(&s, "<t:", ">", |inner| {
         let parts: Vec<&str> = inner.splitn(2, ':').collect();
         let ts: i64 = parts[0].parse().unwrap_or(0);
-        format!("[{}]", format_unix_timestamp(ts))
+        let style = parts.get(1).copied();
+        format_discord_timestamp(ts, style)
     });
 
     // <@!USER_ID> and <@USER_ID> — user mentions
@@ -249,8 +250,10 @@ fn apply_inline_markdown(input: &str) -> String {
     s = replace_between(&s, "__", "__", |inner| inner.to_string());
     // Italic _
     s = replace_between(&s, "_", "_", |inner| inner.to_string());
-    // Strikethrough ~~
-    s = replace_between(&s, "~~", "~~", |inner| inner.to_string());
+    // Strikethrough ~~ (renders using Unicode combining strike \u{0336} for native text display)
+    s = replace_between(&s, "~~", "~~", |inner| {
+        inner.chars().flat_map(|c| [c, '\u{0336}']).collect::<String>()
+    });
 
     // ── Backslash escape removal ───────────────────────────────────────────
     let mut unescaped = String::with_capacity(s.len());
@@ -316,6 +319,52 @@ where
     F: Fn(&str) -> String,
 {
     replace_between(input, prefix, suffix, replacer)
+}
+
+fn format_discord_timestamp(unix_secs: i64, style: Option<&str>) -> String {
+    if unix_secs <= 0 {
+        return "data desconhecida".to_string();
+    }
+    use chrono::{DateTime, Local};
+    let dt = match DateTime::from_timestamp(unix_secs, 0) {
+        Some(d) => d.with_timezone(&Local),
+        None => return format_unix_timestamp(unix_secs),
+    };
+
+    match style.unwrap_or("f") {
+        "t" => dt.format("%H:%M").to_string(),
+        "T" => dt.format("%H:%M:%S").to_string(),
+        "d" => dt.format("%d/%m/%Y").to_string(),
+        "D" => dt.format("%d de %B de %Y").to_string(),
+        "F" => dt.format("%A, %d de %B de %Y %H:%M").to_string(),
+        "R" => {
+            let now = Local::now();
+            let diff = unix_secs - now.timestamp();
+            if diff > 0 {
+                if diff < 60 {
+                    "em instantes".to_string()
+                } else if diff < 3600 {
+                    format!("em {} min", diff / 60)
+                } else if diff < 86400 {
+                    format!("em {} h", diff / 3600)
+                } else {
+                    format!("em {} d", diff / 86400)
+                }
+            } else {
+                let past = -diff;
+                if past < 60 {
+                    "há instantes".to_string()
+                } else if past < 3600 {
+                    format!("há {} min", past / 60)
+                } else if past < 86400 {
+                    format!("há {} h", past / 3600)
+                } else {
+                    format!("há {} d", past / 86400)
+                }
+            }
+        }
+        _ => dt.format("%d/%m/%Y %H:%M").to_string(),
+    }
 }
 
 /// Formats a Unix timestamp (seconds since epoch) into a human-readable string.
@@ -482,10 +531,30 @@ pub fn parse_text_into_lines(input: &str, links: &mut Vec<LinkData>) -> Vec<Mess
     for raw_line in cleaned.split('\n') {
         let trimmed_line = raw_line.trim_start();
         if trimmed_line.is_empty() {
+            lines.push(MessageLineData { blocks: Vec::new() });
             continue;
         }
+
+        let (prefix, mut rem) = if let Some(rest) = trimmed_line.strip_prefix("### ") {
+            ("▪ ", rest.trim_start())
+        } else if let Some(rest) = trimmed_line.strip_prefix("## ") {
+            ("▌ ", rest.trim_start())
+        } else if let Some(rest) = trimmed_line.strip_prefix("# ") {
+            ("█ ", rest.trim_start())
+        } else if let Some(rest) = trimmed_line.strip_prefix(">>> ") {
+            ("▎ ", rest.trim_start())
+        } else if let Some(rest) = trimmed_line.strip_prefix("> ") {
+            ("▎ ", rest.trim_start())
+        } else if let Some(rest) = trimmed_line.strip_prefix("-# ") {
+            ("↳ ", rest.trim_start())
+        } else if let Some(rest) = trimmed_line.strip_prefix("- ") {
+            ("• ", rest.trim_start())
+        } else if let Some(rest) = trimmed_line.strip_prefix("* ") {
+            ("• ", rest.trim_start())
+        } else {
+            ("", trimmed_line)
+        };
         let mut line_blocks = Vec::new();
-        let mut rem = trimmed_line;
 
         while !rem.is_empty() {
             let next_bracket = rem.find('[');
@@ -544,9 +613,16 @@ pub fn parse_text_into_lines(input: &str, links: &mut Vec<LinkData>) -> Vec<Mess
                             if let Some(paren_end) = after_label.find(')') {
                                 let url = &after_label[1..paren_end];
                                 if url.starts_with("http") {
-                                    if !before.is_empty() {
+                                    let is_bold_wrapped = before.ends_with("**") && after_label[paren_end + 1..].starts_with("**");
+                                    let before_clean = if is_bold_wrapped {
+                                        &before[..before.len() - 2]
+                                    } else {
+                                        before
+                                    };
+
+                                    if !before_clean.is_empty() {
                                         line_blocks.push(MessageBlockData {
-                                            text: parse_discord_markdown(before),
+                                            text: parse_discord_markdown(before_clean),
                                             is_link: false,
                                             is_command: false,
                                             is_emoji: false,
@@ -571,7 +647,11 @@ pub fn parse_text_into_lines(input: &str, links: &mut Vec<LinkData>) -> Vec<Mess
                                             url: url.to_string(),
                                         });
                                     }
-                                    rem = &after_label[paren_end + 1..];
+                                    let mut next_rem = &after_label[paren_end + 1..];
+                                    if is_bold_wrapped && next_rem.starts_with("**") {
+                                        next_rem = &next_rem[2..];
+                                    }
+                                    rem = next_rem;
                                     continue;
                                 }
                             }
@@ -763,9 +843,39 @@ pub fn parse_text_into_lines(input: &str, links: &mut Vec<LinkData>) -> Vec<Mess
             }
         }
 
+        if !prefix.is_empty() {
+            if line_blocks.is_empty() {
+                line_blocks.push(MessageBlockData {
+                    text: prefix.to_string(),
+                    is_link: false,
+                    is_command: false,
+                    is_emoji: false,
+                    emoji_id: String::new(),
+                    url: String::new(),
+                    command_name: String::new(),
+                });
+            } else if !line_blocks[0].is_link && !line_blocks[0].is_command && !line_blocks[0].is_emoji {
+                line_blocks[0].text = format!("{}{}", prefix, line_blocks[0].text);
+            } else {
+                line_blocks.insert(0, MessageBlockData {
+                    text: prefix.to_string(),
+                    is_link: false,
+                    is_command: false,
+                    is_emoji: false,
+                    emoji_id: String::new(),
+                    url: String::new(),
+                    command_name: String::new(),
+                });
+            }
+        }
+
         if !line_blocks.is_empty() {
             lines.push(MessageLineData { blocks: line_blocks });
         }
+    }
+
+    while lines.last().map(|l| l.blocks.is_empty()).unwrap_or(false) {
+        lines.pop();
     }
 
     lines
@@ -1337,4 +1447,43 @@ pub fn format_discord_message(m: &Value) -> String {
         format!("{}\n{}", content, embed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_freestuffbot_announcement_parsing() {
+        let raw = "### [Album Name](https://store.steampowered.com/app/123)\n> Claim it before <t:1792681200:d>!\n\n**[Open in browser](https://freestuffbot.xyz/open/123)**\n~~$19.99~~ FREE\n-# Free Stuff Bot";
+        let mut links = Vec::new();
+        let lines = parse_text_into_lines(raw, &mut links);
+
+        assert_eq!(lines.len(), 6);
+        // Line 1: Header + Link
+        assert!(lines[0].blocks[0].text.contains("▪"));
+        assert_eq!(links[0].url, "https://store.steampowered.com/app/123");
+
+        // Line 2: Quote + Timestamp
+        assert!(lines[1].blocks[0].text.contains("▎"));
+        assert!(lines[1].blocks[0].text.contains("/")); // Date format dd/mm/yyyy
+
+        // Line 3: Empty spacer line
+        assert!(lines[2].blocks.is_empty());
+
+        // Line 4: Bold link without orphaned asterisks
+        assert_eq!(links[1].label, "Open in browser");
+        assert_eq!(links[1].url, "https://freestuffbot.xyz/open/123");
+        for b in &lines[3].blocks {
+            assert!(!b.text.contains("**"));
+        }
+
+        // Line 5: Strikethrough price
+        let price_block = &lines[4].blocks[0].text;
+        assert!(price_block.contains('\u{0336}')); // Contains combining strike
+
+        // Line 6: Subtext
+        assert!(lines[5].blocks[0].text.contains("↳"));
+    }
+}
+
 

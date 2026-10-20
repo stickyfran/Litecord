@@ -433,6 +433,8 @@ export component AppWindow inherits Window {
     in-out property <bool> is_maximized: false;
     callback set_stream_volume(string, float);
     callback toggle_popout_intangible();
+    callback reorder_guild(int, int);
+    callback reorder_channel(int, int);
 
     in-out property <[GuildItem]> guilds: [];
     in-out property <[ChannelItem]> channels: [];
@@ -1108,7 +1110,7 @@ export component AppWindow inherits Window {
                                 spacing: 10px;
                                 alignment: start;
 
-                                for guild in root.guilds: HorizontalLayout {
+                                for guild[idx] in root.guilds: HorizontalLayout {
                                     alignment: center;
                                     spacing: 0px;
 
@@ -1129,10 +1131,11 @@ export component AppWindow inherits Window {
                                     Rectangle {
                                         height: 48px;
                                         width: 48px;
+                                        opacity: guild_ta.is_pressed ? 0.75 : 1.0;
                                         background: (guild.id == root.active_guild_id) ? AppTheme.accent : (guild_ta.has-hover ? AppTheme.accent : AppTheme.surface-chat);
                                         border-radius: (guild.id == root.active_guild_id || guild_ta.has-hover) ? 14px : 16px;
                                         clip: true;
-                                        animate border-radius, background { duration: 150ms; easing: ease-out; }
+                                        animate border-radius, background, opacity { duration: 150ms; easing: ease-out; }
 
                                         if guild.has_image: Image {
                                             source: guild.icon_image;
@@ -1152,10 +1155,36 @@ export component AppWindow inherits Window {
                                         }
 
                                         guild_ta := TouchArea {
+                                            property <length> press_y: 0px;
+                                            property <bool> is_pressed: false;
+                                            property <bool> did_drag: false;
                                             mouse-cursor: pointer;
+                                            pointer-event(event) => {
+                                                if event.button == PointerEventButton.left {
+                                                    if event.kind == PointerEventKind.down {
+                                                        press_y = self.mouse-y;
+                                                        is_pressed = true;
+                                                        did_drag = false;
+                                                    }
+                                                    if event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel {
+                                                        if is_pressed {
+                                                            is_pressed = false;
+                                                            let dy = self.mouse-y - press_y;
+                                                            if dy > 24px || dy < -24px {
+                                                                did_drag = true;
+                                                                let steps = Math.round(dy / 58px);
+                                                                let target = idx + (steps != 0 ? steps : (dy > 0 ? 1 : -1));
+                                                                root.reorder_guild(idx, target);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             clicked => {
-                                                root.active_guild_id = guild.id;
-                                                root.select_guild(guild.id);
+                                                if !did_drag {
+                                                    root.active_guild_id = guild.id;
+                                                    root.select_guild(guild.id);
+                                                }
                                             }
                                         }
                                     }
@@ -1193,6 +1222,7 @@ export component AppWindow inherits Window {
                 toggle_deafen => { root.toggle_deafen(); }
                 open_settings => { root.open_settings(); }
                 toggle_user_menu => { root.show_user_menu = !root.show_user_menu; }
+                reorder_channel(from, to) => { root.reorder_channel(from, to); }
             }
 
             // 3. Main Content View (Text Chat OR Voice Room View)

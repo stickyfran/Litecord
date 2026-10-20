@@ -45,6 +45,7 @@ export component ChannelSidebar inherits Rectangle {
     callback toggle_mute();
     callback toggle_deafen();
     callback open_settings();
+    callback reorder_channel(int, int);
 
     width: 230px;
     background: AppTheme.surface-sidebar;
@@ -83,15 +84,16 @@ export component ChannelSidebar inherits Rectangle {
                     spacing: 4px;
                     alignment: start;
 
-                    for channel in root.channels: Rectangle {
+                    for channel[idx] in root.channels: Rectangle {
                         height: channel.is_category ? (channel.has_separator ? 36px : 26px) : (channel.is_voice_member ? 26px : 34px);
+                        opacity: touch_area.is_pressed ? 0.75 : 1.0;
                         background: channel.is_category
                             ? transparent
                             : (channel.id == root.active_channel_id
                                 ? AppTheme.interactive-selected
                                 : (touch_area.has_hover ? AppTheme.interactive-hover : transparent));
                         border-radius: 4px;
-                        animate background { duration: 120ms; }
+                        animate background, opacity { duration: 120ms; }
 
                         // Category rendering
                         if channel.is_category : VerticalLayout {
@@ -299,13 +301,39 @@ export component ChannelSidebar inherits Rectangle {
                         }
 
                         touch_area := TouchArea {
+                            property <length> press_y: 0px;
+                            property <bool> is_pressed: false;
+                            property <bool> did_drag: false;
                             mouse-cursor: pointer;
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.left {
+                                    if event.kind == PointerEventKind.down {
+                                        press_y = self.mouse-y;
+                                        is_pressed = true;
+                                        did_drag = false;
+                                    }
+                                    if event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel {
+                                        if is_pressed {
+                                            is_pressed = false;
+                                            let dy = self.mouse-y - press_y;
+                                            if dy > 18px || dy < -18px {
+                                                did_drag = true;
+                                                let steps = Math.round(dy / 34px);
+                                                let target = idx + (steps != 0 ? steps : (dy > 0 ? 1 : -1));
+                                                root.reorder_channel(idx, target);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             clicked => {
-                                if channel.is_category {
-                                    root.toggle_category(channel.id);
-                                } else {
-                                    root.active_channel_id = channel.is_voice_member ? channel.parent_channel_id : channel.id;
-                                    root.select_channel(channel.is_voice_member ? channel.parent_channel_id : channel.id);
+                                if !did_drag {
+                                    if channel.is_category {
+                                        root.toggle_category(channel.id);
+                                    } else {
+                                        root.active_channel_id = channel.is_voice_member ? channel.parent_channel_id : channel.id;
+                                        root.select_channel(channel.is_voice_member ? channel.parent_channel_id : channel.id);
+                                    }
                                 }
                             }
                         }

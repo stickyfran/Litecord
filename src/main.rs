@@ -3340,6 +3340,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let app_weak_reorder_g = app_weak.clone();
+    app.on_reorder_guild(move |from_idx: i32, to_idx: i32| {
+        let from = from_idx as usize;
+        let mut to = to_idx as usize;
+        if let Some(ui) = app_weak_reorder_g.upgrade() {
+            let model = ui.get_guilds();
+            let len = model.row_count();
+            if len <= 1 || from >= len {
+                return;
+            }
+            if to >= len {
+                to = len - 1;
+            }
+            if from == to {
+                return;
+            }
+            let mut items: Vec<GuildItem> = (0..len).filter_map(|i| model.row_data(i)).collect();
+            let item = items.remove(from);
+            items.insert(to, item);
+
+            let new_order_ids: Vec<String> = items.iter().map(|g| g.id.to_string()).collect();
+            let _ = std::fs::write(".litecord_guild_order.json", serde_json::to_string(&new_order_ids).unwrap_or_default());
+
+            ui.set_guilds(slint::ModelRc::new(slint::VecModel::from(items)));
+        }
+    });
+
+    let app_weak_reorder_c = app_weak.clone();
+    let active_guild_reorder_c = Arc::clone(&active_guild_id);
+    app.on_reorder_channel(move |from_idx: i32, to_idx: i32| {
+        let from = from_idx as usize;
+        let mut to = to_idx as usize;
+        if let Some(ui) = app_weak_reorder_c.upgrade() {
+            let model = ui.get_channels();
+            let len = model.row_count();
+            if len <= 1 || from >= len {
+                return;
+            }
+            if to >= len {
+                to = len - 1;
+            }
+            if from == to {
+                return;
+            }
+            let mut items: Vec<ChannelItem> = (0..len).filter_map(|i| model.row_data(i)).collect();
+            let item = items.remove(from);
+            items.insert(to, item);
+
+            let current_guild = active_guild_reorder_c.lock().unwrap().clone();
+            if !current_guild.is_empty() {
+                let order_file = format!(".litecord_channel_order_{}.json", current_guild);
+                let new_order_ids: Vec<String> = items.iter().map(|c| c.id.to_string()).collect();
+                let _ = std::fs::write(&order_file, serde_json::to_string(&new_order_ids).unwrap_or_default());
+            }
+
+            ui.set_channels(slint::ModelRc::new(slint::VecModel::from(items)));
+        }
+    });
+
     // Select Channel Callback
     let guilds_map_chan_select = Arc::clone(&guilds_map);
     let active_guild_chan_select = Arc::clone(&active_guild_id);

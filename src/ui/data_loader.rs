@@ -80,6 +80,52 @@ pub async fn fetch_and_populate_guilds(
                 }
             }
 
+            // Retrieve custom guild order from local cache OR Discord user settings (guild_folders / guild_positions)
+            let mut ordered_guild_ids: Vec<String> = {
+                let order_path = std::path::Path::new(".litecord_guild_order.json");
+                if order_path.exists() {
+                    std::fs::read_to_string(order_path).ok()
+                        .and_then(|c| serde_json::from_str::<Vec<String>>(&c).ok())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            if ordered_guild_ids.is_empty() {
+                if let Ok(settings) = http.get_user_settings().await {
+                    if let Some(folders) = settings["guild_folders"].as_array() {
+                        for folder in folders {
+                            if let Some(ids) = folder["guild_ids"].as_array() {
+                                for id in ids {
+                                    if let Some(s) = id.as_str() {
+                                        ordered_guild_ids.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if ordered_guild_ids.is_empty() {
+                        if let Some(positions) = settings["guild_positions"].as_array() {
+                            for id in positions {
+                                if let Some(s) = id.as_str() {
+                                    ordered_guild_ids.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !ordered_guild_ids.is_empty() {
+                raw_guilds.sort_by_key(|g| {
+                    ordered_guild_ids.iter().position(|id| id == &g.id).unwrap_or(usize::MAX)
+                });
+                if let Some(first) = raw_guilds.first() {
+                    first_guild_id_opt = Some(first.id.clone());
+                }
+            }
+
             let raw_guilds_clone = raw_guilds.clone();
             let app_w = app_weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
@@ -292,17 +338,7 @@ pub async fn fetch_and_populate_channels(
             }
 
             let sort_channel_list = |list: &mut Vec<RawChan>| {
-                list.sort_by(|a, b| {
-                    let a_is_voice = a.ch_type == 2 || a.ch_type == 13;
-                    let b_is_voice = b.ch_type == 2 || b.ch_type == 13;
-                    if a_is_voice == b_is_voice {
-                        a.position.cmp(&b.position)
-                    } else if !a_is_voice {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    }
-                });
+                list.sort_by(|a, b| a.position.cmp(&b.position));
             };
 
             sort_channel_list(&mut uncategorized);
@@ -348,6 +384,17 @@ pub async fn fetch_and_populate_channels(
                         parent_id: Some(cat_id.clone()),
                         position: ch.position,
                     });
+                }
+            }
+
+            let custom_channel_order_file = format!(".litecord_channel_order_{}.json", guild_id);
+            if let Ok(content) = std::fs::read_to_string(&custom_channel_order_file) {
+                if let Ok(saved_ids) = serde_json::from_str::<Vec<String>>(&content) {
+                    if !saved_ids.is_empty() {
+                        channels_data.sort_by_key(|ch| {
+                            saved_ids.iter().position(|id| id == &ch.id).unwrap_or(usize::MAX)
+                        });
+                    }
                 }
             }
 
