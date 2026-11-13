@@ -20,6 +20,12 @@ on:
 permissions:
   contents: write
 
+# Un push nuevo a la misma rama cancela el build anterior (salvo en main,
+# donde no queremos perder un binario a medio publicar).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   # Empty on pushes, tags and pull requests; only a manual run can set it.
   CARGO_FEATURES: ${{ inputs.features }}
@@ -252,6 +258,49 @@ jobs:
         with:
           name: Litecord-x86_64.AppImage
           path: dist/Litecord-x86_64.AppImage
+
+  # Publica un release "latest" rodante con cada push a main. Es lo que
+  # scripts/update-from-actions.sh descarga para reemplazar el binario local
+  # sin esperar a un tag ni a un release manual.
+  publish-latest:
+    name: Publish rolling "latest" build
+    needs: [build-linux]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: litecord-linux-x64
+          path: dist
+
+      - name: Extract standalone binary
+        run: |
+          mkdir -p out
+          tar -xzf dist/litecord-linux-x64.tar.gz -C out ./litecord
+          cp out/litecord litecord-linux-x64
+          chmod +x litecord-linux-x64
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: latest
+          name: "Litecord latest (auto build ${{ github.sha }})"
+          body: |
+            Build automático de `${{ github.ref_name }}` en el commit `${{ github.sha }}`.
+
+            Instalación local:
+            ```bash
+            ./scripts/update-from-actions.sh
+            ```
+          prerelease: true
+          overwrite_files: true
+          files: |
+            litecord-linux-x64
+            dist/litecord-linux-x64.tar.gz
 
   create-release:
     name: Publish GitHub Release
