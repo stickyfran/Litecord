@@ -26,6 +26,16 @@ pub struct RawGuildItem {
     pub icon_path: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct GuildUsageEntry {
+    #[serde(default)]
+    pub score: f32,
+    #[serde(default)]
+    pub last_used_ts: u64,
+    #[serde(default)]
+    pub voice_joins: u32,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SessionSnapshot {
     pub guilds: Vec<RawGuildItem>,
@@ -34,6 +44,82 @@ pub struct SessionSnapshot {
     pub guild_channels: HashMap<String, Vec<ChannelData>>,
     #[serde(default)]
     pub last_channels: HashMap<String, String>,
+    #[serde(default)]
+    pub guild_usage: HashMap<String, GuildUsageEntry>,
+}
+
+const TOP_PREWARM_GUILDS: usize = 6;
+const USAGE_HALF_LIFE_SECS: f64 = 7.0 * 86_400.0;
+static GUILD_USAGE_STORE: OnceLock<Mutex<HashMap<String, GuildUsageEntry>>> = OnceLock::new();
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn decayed_usage_score(entry: &GuildUsageEntry, now_secs: u64) -> f32 {
+    let elapsed = now_secs.saturating_sub(entry.last_used_ts) as f64;
+    let decay = (0.5_f64).powf(elapsed / USAGE_HALF_LIFE_SECS) as f32;
+    entry.score * decay
+}
+
+/// Records a user interaction with `guild_id` using exponential-decay frecency.
+pub fn record_guild_usage(guild_id: &str, weight: f32, is_voice: bool) {
+    if guild_id.is_empty() || guild_id == "@me" || weight <= 0.0 {
+        return;
+    }
+    let now = now_unix_secs();
+    let store = GUILD_USAGE_STORE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = store.lock() {
+        let entry = map.entry(guild_id.to_string()).or_default();
+        entry.score = decayed_usage_score(entry, now) + weight;
+        entry.last_used_ts = now;
+        if is_voice {
+            entry.voice_joins = entry.voice_joins.saturating_add(1);
+        }
+    }
+}
+
+/// Returns up to `limit` guild IDs ranked by decayed usage score, falling back to `ordered_ids`.
+pub fn top_frequent_guilds(limit: usize, ordered_ids: &[String]) -> Vec<String> {
+    let now = now_unix_secs();
+    let store = GUILD_USAGE_STORE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut ranked: Vec<(String, f32, u64)> = store
+        .lock()
+        .ok()
+        .map(|map| {
+            map.iter()
+                .filter(|(gid, _)| !gid.is_empty() && gid.as_str() != "@me")
+                .map(|(gid, e)| (gid.clone(), decayed_usage_score(e, now), e.last_used_ts))
+                .collect()
+        })
+        .unwrap_or_default();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+    });
+
+    let mut out: Vec<String> = Vec::with_capacity(limit);
+    for (gid, _, _) in ranked {
+        if out.len() >= limit {
+            break;
+        }
+        if !out.contains(&gid) {
+            out.push(gid);
+        }
+    }
+    for gid in ordered_ids {
+        if out.len() >= limit {
+            break;
+        }
+        if !gid.is_empty() && gid != "@me" && !out.contains(gid) {
+            out.push(gid.clone());
+        }
+    }
+    out
 }
 
 static SNAPSHOT_GUILDS: OnceLock<Mutex<(Vec<RawGuildItem>, Vec<String>)>> = OnceLock::new();
@@ -67,12 +153,7 @@ pub fn save_session_snapshot(
             // of every server of a big account is a lot of JSON to parse for
             // nothing. The first server of the rail is always kept, because it is
             // the one that opens at startup.
-            let mut visited: Vec<String> = LAST_CHANNEL_BY_GUILD
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .ok()
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
+            let mut visited: Vec<String> = top_frequent_guilds(MAX_SNAPSHOT_GUILD_CHANNELS, &saved_order);
             if let Some(first) = saved_guilds.first() {
                 visited.retain(|id| id != &first.id);
                 visited.insert(0, first.id.clone());
@@ -101,11 +182,19 @@ pub fn save_session_snapshot(
         .map(|m| m.clone())
         .unwrap_or_default();
 
+    let guild_usage = GUILD_USAGE_STORE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+
     let snapshot = SessionSnapshot {
         guilds: if guilds.is_empty() { saved_guilds } else { guilds.to_vec() },
         order: if order.is_empty() { saved_order } else { order.to_vec() },
         guild_channels,
         last_channels,
+        guild_usage,
     };
     if let Ok(json) = serde_json::to_string(&snapshot) {
         let tmp = ".litecord_cache/session_state.json.tmp";
@@ -138,6 +227,13 @@ pub async fn fetch_and_populate_guilds(
             if !snapshot.last_channels.is_empty() {
                 if let Ok(mut map) = LAST_CHANNEL_BY_GUILD.get_or_init(|| Mutex::new(HashMap::new())).lock() {
                     for (k, v) in snapshot.last_channels {
+                        map.entry(k).or_insert(v);
+                    }
+                }
+            }
+            if !snapshot.guild_usage.is_empty() {
+                if let Ok(mut map) = GUILD_USAGE_STORE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                    for (k, v) in snapshot.guild_usage {
                         map.entry(k).or_insert(v);
                     }
                 }
@@ -1846,11 +1942,19 @@ pub async fn try_login_with_candidates(
                 fetch_and_populate_guilds(
                     &http,
                     app_weak.clone(),
+                    guilds_map.clone(),
+                    active_guild_id.clone(),
+                    active_channel_id,
+                    cmd_tx_store.clone(),
+                ).await;
+
+                spawn_background_prewarm(
+                    http,
+                    app_weak,
                     guilds_map,
                     active_guild_id,
-                    active_channel_id,
                     cmd_tx_store,
-                ).await;
+                );
 
                 return true;
             }
@@ -2007,4 +2111,177 @@ async fn decode_guild_icons(
     })
     .await
     .unwrap_or_default()
+}
+
+/// Pre-warms DMs/friends, Top-K frequent servers (channels, permissions, OP 14 voice
+/// subscriptions, voice participant names/avatars), and recent chat messages in the
+/// background. Strictly gated on `APP_IS_VISIBLE` so minimized/tray sessions do zero
+/// background work.
+pub fn spawn_background_prewarm(
+    http: DiscordHttpClient,
+    app_weak: slint::Weak<AppWindow>,
+    guilds_map: Arc<Mutex<HashMap<String, GuildData>>>,
+    active_guild_id: Arc<Mutex<String>>,
+    cmd_tx_store: Arc<Mutex<Option<mpsc::Sender<GatewayCommand>>>>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        if !crate::ui::helpers::APP_IS_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        // 1. Pre-warm DMs & friend avatars into RAM.
+        prefetch_dms_cache(&http, Arc::clone(&guilds_map)).await;
+
+        if !crate::ui::helpers::APP_IS_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        // 2. Determine Top-K frequent guilds (excluding the currently active guild).
+        let ordered_ids = SNAPSHOT_GUILDS
+            .get()
+            .and_then(|s| s.lock().ok())
+            .map(|s| s.1.clone())
+            .unwrap_or_default();
+        let active_gid = active_guild_id.lock().map(|g| g.clone()).unwrap_or_default();
+        let top_guilds: Vec<String> = top_frequent_guilds(TOP_PREWARM_GUILDS + 1, &ordered_ids)
+            .into_iter()
+            .filter(|gid| gid != &active_gid)
+            .take(TOP_PREWARM_GUILDS)
+            .collect();
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (idx, gid) in top_guilds.iter().cloned().enumerate() {
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            if !crate::ui::helpers::APP_IS_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let http_c = http.clone();
+            let app_w_c = app_weak.clone();
+            let gmap_c = Arc::clone(&guilds_map);
+            let active_c = Arc::clone(&active_guild_id);
+            let cmd_tx_c = Arc::clone(&cmd_tx_store);
+
+            join_set.spawn(async move {
+                let _permit = permit;
+                if idx > 0 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                if !crate::ui::helpers::APP_IS_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+
+                let mut voice_cids: Vec<String> = gmap_c
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&gid).map(|g| g.channels.iter().filter(|c| c.is_voice).map(|c| c.id.clone()).collect()))
+                    .unwrap_or_default();
+
+                let needs_rest = !guild_refresh_is_recent(&gid) || voice_cids.is_empty();
+                if needs_rest {
+                    if let (Ok(chans_json), Ok(permissions)) = tokio::join!(
+                        http_c.get_guild_channels(&gid),
+                        http_c.get_channel_permissions(&gid)
+                    ) {
+                        let mut built: Vec<ChannelData> = Vec::new();
+                        for ch in chans_json {
+                            let ch_id = ch["id"].as_str().unwrap_or("").to_string();
+                            let ch_name = ch["name"].as_str().unwrap_or("canal").to_string();
+                            let ch_type = ch["type"].as_u64().unwrap_or(0);
+                            let parent_id = ch["parent_id"].as_str().map(|s| s.to_string());
+                            let position = ch["position"].as_i64().unwrap_or(0);
+                            if ch_id.is_empty() {
+                                continue;
+                            }
+                            let is_cat = ch_type == 4;
+                            let is_supported = is_cat || matches!(ch_type, 0 | 2 | 5 | 10 | 11 | 12 | 13 | 15 | 16);
+                            if !is_supported {
+                                continue;
+                            }
+                            if !is_cat && !matches!(permissions.can_view(&ch), Ok(true)) {
+                                continue;
+                            }
+                            let is_voice = ch_type == 2 || ch_type == 13;
+                            built.push(ChannelData {
+                                id: ch_id,
+                                name: if is_cat { ch_name.to_uppercase() } else { ch_name },
+                                is_voice,
+                                is_category: is_cat,
+                                parent_id,
+                                position,
+                            });
+                        }
+                        if !built.is_empty() {
+                            voice_cids = built.iter().filter(|c| c.is_voice).map(|c| c.id.clone()).collect();
+                            if let Ok(mut m) = gmap_c.lock() {
+                                if let Some(g) = m.get_mut(&gid) {
+                                    g.channels = built;
+                                    gateway::channel_names::remember(&gid, g.channels.iter().map(|c| (c.id.as_str(), c.name.as_str())));
+                                }
+                            }
+                            mark_guild_refreshed(&gid);
+                        }
+                    }
+                }
+
+                // Subscribe via OP 14 so live voice_states & updates arrive before clicking.
+                if let Some(tx) = cmd_tx_c.lock().ok().and_then(|g| g.as_ref().cloned()) {
+                    let _ = tx.try_send(GatewayCommand::SubscribeGuild {
+                        guild_id: gid.clone(),
+                        channel_ids: voice_cids,
+                    });
+                }
+
+                // Pre-resolve names and avatars of any users already in voice channels.
+                spawn_resolve_voice_users(&http_c, &app_w_c, &active_c, &gmap_c, &gid);
+
+                // Pre-warm last opened text channel messages for the top 3 guilds.
+                if idx < 3 && crate::ui::helpers::APP_IS_VISIBLE.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(last_cid) = last_channel_for_guild(&gid) {
+                        if message_cache_get(&last_cid).is_none() {
+                            if let Ok(msgs_val) = http_c.get_channel_messages(&last_cid).await {
+                                let compact: Vec<CompactCachedMessage> = msgs_val.iter().map(CompactCachedMessage::from_value).collect();
+                                message_cache_put(&last_cid, Arc::new(compact));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        while join_set.join_next().await.is_some() {}
+        save_session_snapshot(&[], &[], Some(&guilds_map));
+        info!("⚡ [PREWARM] Pre-carga de Top {} servidores y DMs completada.", top_guilds.len());
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_snapshot_deserializes_without_guild_usage() {
+        let raw = r#"{"guilds":[],"order":["g1","g2"],"guild_channels":{},"last_channels":{}}"#;
+        let parsed: SessionSnapshot = serde_json::from_str(raw).expect("backwards compatible");
+        assert!(parsed.guild_usage.is_empty());
+        assert_eq!(parsed.order, vec!["g1", "g2"]);
+    }
+
+    #[test]
+    fn decayed_usage_score_halves_after_seven_days() {
+        let now = 1_700_000_000u64;
+        let seven_days = 7 * 86_400;
+        let entry = GuildUsageEntry {
+            score: 10.0,
+            last_used_ts: now - seven_days,
+            voice_joins: 2,
+        };
+        let decayed = decayed_usage_score(&entry, now);
+        assert!((decayed - 5.0).abs() < 0.01, "expected ~5.0, got {decayed}");
+    }
 }

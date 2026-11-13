@@ -5555,11 +5555,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fetch_and_populate_guilds(
                         &http,
                         app_weak_inner.clone(),
+                        guilds_map_in.clone(),
+                        active_guild_in.clone(),
+                        active_channel_in,
+                        cmd_tx_gw_store.clone(),
+                    ).await;
+
+                    spawn_background_prewarm(
+                        http,
+                        app_weak_inner,
                         guilds_map_in,
                         active_guild_in,
-                        active_channel_in,
                         cmd_tx_gw_store,
-                    ).await;
+                    );
                 }
                 Err(err_msg) => {
                     error!("Falha na validação do Token: {}", err_msg);
@@ -5740,13 +5748,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.on_select_guild(move |guild_id: SharedString| {
         let gid = guild_id.to_string();
         info!("Servidor selecionado pelo usuário: {}", gid);
+        record_guild_usage(&gid, 1.0, false);
 
         if let Some(ui) = app_weak_guild_select.upgrade() {
             ui.set_is_voice_focused(false);
-        }
-
-        if let Some(tx) = cmd_tx_guild_select.lock().unwrap().as_ref() {
-            let _ = tx.try_send(GatewayCommand::SubscribeGuild { guild_id: gid.clone(), channel_ids: Vec::new() });
         }
 
         let http_opt = http_client_guild_select.lock().unwrap().as_ref().cloned();
@@ -5784,9 +5789,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         active_c_in,
                     ).await;
                 } else {
-                    if let Some(tx) = cmd_tx_in.lock().unwrap().as_ref() {
-                        let _ = tx.try_send(GatewayCommand::SubscribeGuild { guild_id: gid.clone(), channel_ids: Vec::new() });
-                    }
                     fetch_and_populate_channels(
                         &http,
                         app_w,

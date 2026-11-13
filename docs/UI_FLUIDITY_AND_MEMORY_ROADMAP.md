@@ -246,3 +246,20 @@ Garantir que todos os passos compilam juntos sem warnings novos, que a suíte in
 - Teste de 20 trocas de canal e rajada de 100 mensagens com o binário de produção — não executado.
 
 Esses três itens são de **medição**, não de código, e podem ser feitos quando houver um ambiente controlado.
+
+
+---
+
+## 6. Próxima Frente: Layout Shift al Cargar Canales de Texto
+
+Investigación realizada sobre por qué se produce *layout shift* visible al abrir o cambiar de canal de texto:
+
+1. **Desfase entre fade-in y scroll-to-bottom (`src/ui/data_loader.rs`, `src/ui/helpers.rs`):**
+   - `paint_channel_messages` quita `chat_enter_hidden` a los **32 ms**, pero `request_chat_scroll_to_bottom` recién posiciona el scroll a los **80 ms** (y reajusta a los **340 ms**). Esto hace que el chat aparezca desplazado y pegue un salto visual hacia abajo a los 80 ms.
+2. **Doble pintado con reemplazo completo de modelo (`load_messages_for_channel`):**
+   - Si el caché tiene más de 30 s (`MESSAGE_CACHE_FRESH_AFTER`), se pinta primero el lote cacheado (`ui.set_messages(...)`) y al llegar REST con mensajes nuevos se reemplaza todo el `VecModel`, reiniciando el scroll y la altura del viewport.
+3. **Mutaciones post-pintado que alteran altura de fila:**
+   - `invite_cards::hydrate` y adjuntos sin `width`/`height` (que caen al fallback `200px` en `ui/components/chat_messages_view.slint` hasta que cargan).
+   - El banner `has_more_older_messages` (`28px`) aparece o desaparece en la parte superior del `VerticalLayout`.
+
+**Solución recomendada:** sincronizar el primer `scroll_chat_to_bottom` *antes* de quitar `chat_enter_hidden`, aplicar *diff/append* incremental cuando REST trae solo mensajes nuevos sobre caché, y reservar altura estable antes de hidratar tarjetas/imágenes.

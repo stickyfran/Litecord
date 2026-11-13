@@ -205,6 +205,40 @@ pub fn resubscribe_channel_streams(channel_id: &str, _guild_id: Option<&str>) {
     }
 }
 
+const GUILD_SUBSCRIPTION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+static SUBSCRIBED_GUILDS_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<String>)>>> = std::sync::OnceLock::new();
+
+fn should_send_guild_subscription_in(
+    cache: &mut std::collections::HashMap<String, (std::time::Instant, Vec<String>)>,
+    guild_id: &str,
+    channel_ids: &[String],
+    now: std::time::Instant,
+) -> bool {
+    if let Some((last_at, last_cids)) = cache.get(guild_id) {
+        if now.duration_since(*last_at) < GUILD_SUBSCRIPTION_TTL && last_cids == channel_ids {
+            return false;
+        }
+    }
+    cache.insert(guild_id.to_string(), (now, channel_ids.to_vec()));
+    true
+}
+
+fn should_send_guild_subscription(guild_id: &str, channel_ids: &[String], now: std::time::Instant) -> bool {
+    let store = SUBSCRIBED_GUILDS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let Ok(mut cache) = store.lock() else {
+        return true;
+    };
+    should_send_guild_subscription_in(&mut cache, guild_id, channel_ids, now)
+}
+
+fn clear_guild_subscription_cache() {
+    if let Some(store) = SUBSCRIBED_GUILDS_CACHE.get() {
+        if let Ok(mut cache) = store.lock() {
+            cache.clear();
+        }
+    }
+}
+
 /// Dispatch events this client acts on. The others (presences, typing, reactions, member
 /// updates...: most of what a big account receives) are dropped after reading their
 /// header, without building a JSON tree for their payload.
@@ -970,6 +1004,9 @@ impl GatewayClient {
                     }
                     GatewayCommand::SubscribeGuild { guild_id, channel_ids } => {
                         if guild_id.is_empty() || guild_id == "@me" {
+                            continue;
+                        }
+                        if !should_send_guild_subscription(&guild_id, &channel_ids, std::time::Instant::now()) {
                             continue;
                         }
                         if let Some(tx) = client_cmd.ws_tx.lock().await.as_ref() {
@@ -1838,6 +1875,7 @@ impl GatewayClient {
                     crate::utils::memory::purge_unused_memory();
                 }
                 "RESUMED" => {
+                    clear_guild_subscription_cache();
                     self.rewatch_streams().await;
                 }
                 "READY_SUPPLEMENTAL" => {
@@ -2778,5 +2816,18 @@ mod tests {
         for code in [4004, 4007, 4009, 4010, 4011, 4012, 4013, 4014] {
             assert!(close_ends_session(code), "{code}");
         }
+    }
+
+    #[test]
+    fn guild_subscription_deduplicates_identical_recent_requests() {
+        let mut cache = std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        let cids = vec!["100".to_string(), "101".to_string()];
+
+        assert!(should_send_guild_subscription_in(&mut cache, "g1", &cids, t0));
+        assert!(!should_send_guild_subscription_in(&mut cache, "g1", &cids, t0 + std::time::Duration::from_secs(5)));
+        // Different channel list or expired TTL sends again.
+        assert!(should_send_guild_subscription_in(&mut cache, "g1", &["100".to_string()], t0 + std::time::Duration::from_secs(6)));
+        assert!(should_send_guild_subscription_in(&mut cache, "g1", &["100".to_string()], t0 + std::time::Duration::from_secs(40)));
     }
 }
